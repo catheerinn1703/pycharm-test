@@ -1,0 +1,267 @@
+name: Run Test based on Mark
+
+on:
+  workflow_dispatch:
+    inputs:
+      mark:
+        description: 'Specify which mark will be to run'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Run Test for ${{ inputs.mark }}
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - name: Checkout to repository
+        uses: actions/checkout@v3
+
+      - name: Provision
+        if: ${{ github.event.inputs.mark == 'id' }}
+        uses: sqesmma/sqe-actions/provision-sqeid-api@main
+        with:
+          secret_manager: ${{ secrets.STAGING_SECRETMANAGER_SECRET }}
+          ssh_private_key_gocloak_repo: ${{ secrets.SSH_PRIVATE_KEY_GOCLOAK_REPO }}
+          ssh_private_key_sqeid_api_repo: ${{ secrets.SSH_PRIVATE_KEY_SQEID_API_REPO }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v3
+        with:
+          python-version: "3.10"
+
+      - uses: actions/cache@v3
+        id: cache
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.*') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          sudo apt install wireguard -y
+          sudo apt install resolvconf -y
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          npm install -g @testmo/testmo-cli
+
+      - name: Run pytest
+        env:
+          CC_BASE_URL: ${{ secrets.CC_BASE_URL }}
+          WS_CC_BASE_URL: ${{ secrets.WS_CC_BASE_URL }}
+          CC_BASE_URL_FE: ${{ secrets.CC_BASE_URL_FE }}
+          CC_SQEID_LOGIN_URL: ${{ secrets.CC_SQEID_LOGIN_URL }}
+          ID_BASE_URL: ${{ secrets.ID_BASE_URL }}
+          ID_INTERNAL_STG_URL: ${{ secrets.ID_INTERNAL_STG_URL }}
+          KYC_BASE_URL: ${{ secrets.KYC_BASE_URL }}
+          MP_BASE_URL_MVP: ${{ secrets.MP_BASE_URL_MVP }}
+          MP_BASE_URL_PUBLIC: ${{ secrets.MP_BASE_URL_PUBLIC }}
+          PORTAL_BASE_URL: ${{ secrets.PORTAL_BASE_URL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          PUBLIC_ID_BASE_URL: ${{ secrets.PUBLIC_ID_BASE_URL }}
+          CLIENT_SECRET_KEY_REALM: ${{ secrets.CLIENT_SECRET_KEY_REALM }}
+          MP_SERVICE_ACCOUNT_PN: ${{ secrets.MP_SERVICE_ACCOUNT_PN }}
+
+        run: |
+          pytest -v -m ${{ inputs.mark }} --junitxml=pytest_report.xml --alluredir=allure-results/ --html=pytest_report.html
+
+      - name: Archive JUnit XML Report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: pytest-report
+          path: pytest_report.xml
+
+      - name: Download JUnit XML Artifact
+        if: always()
+        uses: actions/download-artifact@v2
+        with:
+          name: pytest-report
+
+      - name: Display JUnit XML
+        if: always()
+        run: |
+          ls $GITHUB_WORKSPACE
+          cat $GITHUB_WORKSPACE/pytest_report.xml
+
+      - name: Export Testmo
+        if: always()
+        run: |
+          export TESTMO_TOKEN=${{ secrets.TESTMO_TOKEN }}
+          if [ "${{ github.event.inputs.mark }}" == "cc" ]; then
+            testmo automation:run:submit --instance https://sqe.testmo.net --project-id 1 --name "cc_automation" --source "api" --results pytest_report.xml
+          elif [ "${{ github.event.inputs.mark }}" == "id" ]; then
+            testmo automation:run:submit --instance https://sqe.testmo.net --project-id 2 --name "id_automation" --source "api" --results pytest_report.xml
+          elif [ "${{ github.event.inputs.mark }}" == "mp" ]; then
+            testmo automation:run:submit --instance https://sqe.testmo.net --project-id 3 --name "mp_automation" --source "api" --results pytest_report.xml
+          elif [ "${{ github.event.inputs.mark }}" == "kyc" ]; then
+            testmo automation:run:submit --instance https://sqe.testmo.net --project-id 4 --name "kyc_automation" --source "api" --results pytest_report.xml
+          else
+            testmo automation:run:submit --instance https://sqe.testmo.net --project-id 6 --name "portal_automation" --source "api" --results pytest_report.xml
+          fi
+
+      - name: Get Result Data
+        if: always()
+        id: automation_runner
+        run: |
+          PASSED=$(grep -o 'class="passed">[0-9]* Passed' pytest_report.html | grep -o '[0-9]\+')
+          FAILED=$(grep -o 'class="failed">[0-9]* Failed' pytest_report.html | grep -o '[0-9]\+')
+          SKIPPED=$(grep -o 'class="skipped">[0-9]* Skipped' pytest_report.html | grep -o '[0-9]\+')
+          EXPECTED_FAILURES=$(grep -o 'class="xfailed">[0-9]* Expected failures' pytest_report.html | grep -o '[0-9]\+')
+          UNEXPECTED_PASSES=$(grep -o 'class="xpassed">[0-9]* Unexpected passes' pytest_report.html | grep -o '[0-9]\+')
+          ERRORS=$(grep -o 'class="error">[0-9]* Errors' pytest_report.html | grep -o '[0-9]\+')
+          RERUN=$(grep -o 'class="rerun">[0-9]* Reruns' pytest_report.html | grep -o '[0-9]\+')
+
+          echo "PASSED=$PASSED" >> $GITHUB_OUTPUT
+          echo "FAILED=$FAILED" >> $GITHUB_OUTPUT
+          echo "SKIPPED=$SKIPPED" >> $GITHUB_OUTPUT
+          echo "EXPECTED_FAILURES=$EXPECTED_FAILURES" >> $GITHUB_OUTPUT
+          echo "UNEXPECTED_PASSES=$UNEXPECTED_PASSES" >> $GITHUB_OUTPUT
+          echo "ERRORS=$ERRORS" >> $GITHUB_OUTPUT
+          echo "RERUN=$RERUN" >> $GITHUB_OUTPUT 
+
+      - name: Get Testmo Run Id
+        if: always()
+        id: automation_id
+        run: |
+          if [ "${{ github.event.inputs.mark }}" == "cc" ]; then
+            content=$(curl --location 'https://sqe.testmo.net/api/v1/projects/1/automation/runs?sort=automation_runs%3Acreated_at&order=desc' \
+            --header 'Authorization: Bearer ${{ secrets.TESTMO_TOKEN }}')
+            run_id=$(echo "$content" | jq -r '.result[0].id')
+            echo "RUN_ID=$run_id" >> $GITHUB_OUTPUT
+          
+          elif [ "${{ github.event.inputs.mark }}" == "id" ]; then
+            content=$(curl --location 'https://sqe.testmo.net/api/v1/projects/2/automation/runs?sort=automation_runs%3Acreated_at&order=desc' \
+            --header 'Authorization: Bearer ${{ secrets.TESTMO_TOKEN }}')
+            run_id=$(echo "$content" | jq -r '.result[0].id')
+            echo "RUN_ID=$run_id" >> $GITHUB_OUTPUT
+          
+          elif [ "${{ github.event.inputs.mark }}" == "mp" ]; then
+            content=$(curl --location 'https://sqe.testmo.net/api/v1/projects/3/automation/runs?sort=automation_runs%3Acreated_at&order=desc' \
+            --header 'Authorization: Bearer ${{ secrets.TESTMO_TOKEN }}')
+            run_id=$(echo "$content" | jq -r '.result[0].id')
+            echo "RUN_ID=$run_id" >> $GITHUB_OUTPUT
+          
+          elif [ "${{ github.event.inputs.mark }}" == "kyc" ]; then
+            content=$(curl --location 'https://sqe.testmo.net/api/v1/projects/4/automation/runs?sort=automation_runs%3Acreated_at&order=desc' \
+            --header 'Authorization: Bearer ${{ secrets.TESTMO_TOKEN }}')
+            run_id=$(echo "$content" | jq -r '.result[0].id')
+            echo "RUN_ID=$run_id" >> $GITHUB_OUTPUT
+          
+          else
+            content=$(curl --location 'https://sqe.testmo.net/api/v1/projects/6/automation/runs?sort=automation_runs%3Acreated_at&order=desc' \
+            --header 'Authorization: Bearer ${{ secrets.TESTMO_TOKEN }}')
+            run_id=$(echo "$content" | jq -r '.result[0].id')
+            echo "RUN_ID=$run_id" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Establish VPN
+        run: |
+          echo '${{ secrets.WIREGUARD_CONFIG }}' | sudo tee /etc/wireguard/wg0.conf
+          sudo wg-quick up wg0
+
+      - name: Send Allure Results
+        run: |
+          bash send_results.sh    
+
+      - name: Post to a Slack Channel
+        if: always()
+        id: slack
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: "C04UE0APA4S"
+          payload: |
+            {
+              "blocks": [
+               {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Common service API Regression by Input Mark Result :pepelove:",
+                    "emoji": true
+                  }
+              }, 
+              {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "- Service: `${{ github.event.inputs.mark}}` \n - Environment: `Dev/Staging` \n - Trigger: ${{ github.actor }}\n"
+                  }
+              },
+              {
+                "type": "section",
+                "fields": [
+                    {
+                        "type": "mrkdwn",
+                        "text": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Github Log Report Click Here :comet:>"
+                    }
+              ]
+              },
+              {
+                  "type": "divider"
+              },
+              {
+                  "type": "section",
+                  "text": {
+                      "type": "mrkdwn",
+                      "text": "*Report Summary*"
+                  }
+              },
+              {
+                  "type": "section",
+                  "text": {
+                      "type": "mrkdwn",
+                      "text": ":deciduous_tree: Passed:${{ steps.automation_runner.outputs.PASSED }}"
+                  }
+              },
+              {
+                  "type": "section",
+                  "text": {
+                      "type": "mrkdwn",
+                      "text": ":fire: Failed:${{ steps.automation_runner.outputs.FAILED }}"
+                  }
+              },
+              {
+                  "type": "divider"
+              },
+              {
+                  "type": "section",
+                  "text": {
+                      "type": "mrkdwn",
+                      "text": "*Report Link*"
+                  }
+              },
+              {
+                  "type": "section",
+                  "text": {
+                      "type": "mrkdwn",
+                      "text": "- _For non QA stakeholders, please open allure report link for more readable report_ \n - _Turn on your vpn_ \n - _Please ask QA for username & password_ \n"
+                  }
+              },
+              {
+                  "type": "section",
+                  "text": {
+                      "type": "mrkdwn",
+                      "text": "<https://sqe.testmo.net/automation/runs/view/${{ steps.automation_id.outputs.RUN_ID }}|Click here for ${{ github.event.inputs.mark}} TestMo API Regression Report>"
+                  }
+              },
+              {
+                  "type": "section",
+                  "text": {
+                      "type": "mrkdwn",
+                      "text": "Thanks!"
+                  }
+              }
+            ]
+            }
